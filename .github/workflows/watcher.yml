@@ -22,8 +22,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run script
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TOKEN_1: ${{ secrets.TOKEN_1 }}
-          REPO: ${{ secrets.REPO }}
-        run: python watch.py
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  TOKEN_1: ${{ secrets.TOKEN_1 }}
+  REPO: ${{ secrets.REPO }}
