@@ -22,7 +22,7 @@ ARXIV_FEEDS = [
 ]
 
 # === Hugging Face Inference API 設定 ===
-HF_MODEL = "google/mt5-large"
+HF_MODEL = "elyza/summary-large-japanese"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
