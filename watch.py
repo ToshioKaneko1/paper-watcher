@@ -77,4 +77,3 @@ if __name__ == "__main__":
         body = "本日の該当論文はありませんでした。"
 
     create_issue(title, body)
-``
