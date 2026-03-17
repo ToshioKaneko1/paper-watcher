@@ -6,9 +6,9 @@ import openai
 from datetime import datetime
 
 # === Secrets ===
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-REPO = os.getenv("GITHUB_REPO")  # "username/paper-watcher"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # ← Secret 名そのまま
+GITHUB_TOKEN = os.getenv("TOKEN_1")             # ← Secret 名 TOKEN_1 に対応
+REPO = os.getenv("REPO")                        # ← Secret 名 REPO に対応
 
 openai.api_key = OPENAI_API_KEY
 
@@ -29,9 +29,9 @@ def summarize(text):
     prompt = f"""
 電子顕微鏡研究者向けに以下の論文を350字以内で要約してください。
 ・新規性（できるだけ数値）
-・分解能（必ず）
-・技術的ポイント（4D-STEM/ptycho/EELS/検出器など）
-・応用
+・分解能（必ず記載）
+・技術的ポイント（4D-STEM / EELS / ptychography 等）
+・応用可能性
 
 本文:
 {text}
@@ -42,6 +42,7 @@ def summarize(text):
     )
     return res["choices"][0]["message"]["content"]
 
+
 # === Fetch arXiv ===
 def fetch_arxiv():
     results = []
@@ -50,7 +51,9 @@ def fetch_arxiv():
         for entry in feed.entries:
             if any(k.lower() in entry.title.lower() for k in KEYWORDS):
                 summary = summarize(entry.summary)
-                results.append(f"■ **{entry.title}**\n{summary}\nURL: {entry.link}")
+                results.append(
+                    f"■ **{entry.title}**\n{summary}\nURL: {entry.link}"
+                )
     return results
 
 # === Create GitHub Issue ===
@@ -59,6 +62,7 @@ def create_issue(title, body):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     data = {"title": title, "body": body}
     requests.post(api_url, headers=headers, json=data)
+
 
 # === Main ===
 if __name__ == "__main__":
@@ -73,3 +77,4 @@ if __name__ == "__main__":
         body = "本日の該当論文はありませんでした。"
 
     create_issue(title, body)
+``
