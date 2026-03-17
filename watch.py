@@ -4,15 +4,18 @@ import requests
 import feedparser
 import openai
 from datetime import datetime
+from bs4 import BeautifulSoup
+from PyPDF2 import PdfReader
+from io import BytesIO
 
 # === Secrets ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GITHUB_TOKEN = os.getenv("TOKEN_1")    # ← Secret 名 TOKEN_1
-REPO = os.getenv("REPO")               # ← Secret 名 REPO
+GITHUB_TOKEN = os.getenv("TOKEN_1")   # ← Secret: TOKEN_1
+REPO = os.getenv("REPO")              # ← Secret: REPO ("username/paper-watcher")
 
 openai.api_key = OPENAI_API_KEY
 
-# === Keywords for filtering ===
+# === Keywords for arXiv filtering ===
 KEYWORDS = [
     "4D-STEM", "vibrational EELS", "monochromated EELS",
     "phase contrast TEM", "DPC", "ptychography", "NBD"
@@ -24,16 +27,30 @@ ARXIV_FEEDS = [
     "https://export.arxiv.org/rss/physics.ins-det"
 ]
 
+# === Manufacturer & University sites (URLは必要に応じて調整してください) ===
+MANUFACTURER_SITES = [
+    {"name": "JEOL",   "url": "https://www.jeol.co.jp/news/"},
+    {"name": "Thermo Fisher", "url": "https://www.thermofisher.com/blog/"},
+    {"name": "Hitachi High-Tech", "url": "https://www.hitachi-hightech.com/global/en/news/"}
+]
 
-# === AI Summary ===
-def summarize(text):
+UNIVERSITY_SITES = [
+    {"name": "UTokyo", "url": "https://www.u-tokyo.ac.jp/focus/en/"},
+    {"name": "KyotoU", "url": "https://www.kyoto-u.ac.jp/en/research-news"},
+    {"name": "TohokuU","url": "https://www.tohoku.ac.jp/en/news/research/"},
+    {"name": "OsakaU", "url": "https://resou.osaka-u.ac.jp/en"},
+    {"name": "KyushuU","url": "https://www.kyushu-u.ac.jp/en/researches/view/"}
+    # NIMS, AIST なども追加可能
+]
+
+# === 共通：AI 要約 ===
+def summarize(text, context="論文/ニュース"):
     prompt = f"""
-電子顕微鏡研究者向けに以下の論文を要約してください。
-特に以下に注意して300字以内に：
-
+電子顕微鏡研究者向けに、以下の{context}を300字以内で要約してください。
+特に以下に注意してください：
 ・新規性（できるだけ数値）
-・分解能（値を必ず）
-・技術的ポイント（4D-STEM/EELS/ptychographyなど）
+・分解能（値があれば必ず記載）
+・技術的ポイント（観察法・検出器・加速電圧など）
 ・応用分野
 
 本文:
@@ -46,52 +63,161 @@ def summarize(text):
     return res["choices"][0]["message"]["content"]
 
 
-# === A. Keywords match mode（今までの機能） ===
+# === A. arXiv キーワードマッチ ===
 def fetch_keyword_matches():
     results = []
     for url in ARXIV_FEEDS:
         feed = feedparser.parse(url)
         for entry in feed.entries:
             if any(k.lower() in entry.title.lower() for k in KEYWORDS):
-                summary = summarize(entry.summary)
+                summary = summarize(entry.summary, context="arXiv論文")
                 results.append(
                     f"■ **{entry.title}**\n{summary}\nURL: {entry.link}"
                 )
     return results
 
 
-# === B. New Feature：arXiv最新3件ピックアップ ===
+# === B. arXiv 最新3件 ===
 def fetch_latest_three():
-    # “全エントリ”を集める
     all_entries = []
     for url in ARXIV_FEEDS:
         feed = feedparser.parse(url)
         all_entries.extend(feed.entries)
 
-    # pubDate の新しい順にソート
-    all_entries.sort(
-        key=lambda x: x.get("published_parsed", datetime.min),
-        reverse=True
-    )
+    # published_parsed が無い場合の安全対策
+    def sort_key(e):
+        return e.get("published_parsed") or datetime.min
 
-    # 上位3件
+    all_entries.sort(key=sort_key, reverse=True)
     latest_three = all_entries[:3]
 
     results = []
     for entry in latest_three:
-        summary = summarize(entry.summary)
+        summary = summarize(entry.summary, context="arXiv新着論文")
         results.append(
             f"● **{entry.title}**\n{summary}\nURL: {entry.link}"
         )
     return results
 
 
+# === C. メーカー技術ニュース取得 + PDF URL 抽出 ===
+def fetch_manufacturer_news():
+    news_results = []
+    pdf_urls = []
+
+    for site in MANUFACTURER_SITES:
+        name = site["name"]
+        url = site["url"]
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+        except Exception as e:
+            news_results.append(f"【{name}】ニュース取得エラー: {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # 非常に単純化した例: "aタグ"を上から数件ピックアップ
+        links = soup.find_all("a", href=True)
+        count = 0
+        for a in links:
+            href = a["href"]
+            title = a.get_text(strip=True)
+            if not title or len(title) < 10:
+                continue
+
+            # 絶対URLへ
+            if href.startswith("/"):
+                base = url.rstrip("/")
+                href = base + href
+
+            # PDFリンクなら pdf_urls に追加
+            if href.lower().endswith(".pdf"):
+                pdf_urls.append(href)
+
+            # ニュースとして3件だけ取得
+            if count < 3:
+                summary = summarize(title, context=f"{name} 技術ニュース（タイトルベース）")
+                news_results.append(f"【{name}】{summary}\nURL: {href}")
+                count += 1
+            else:
+                break
+
+    return news_results, pdf_urls
+
+
+# === D. 大学ニュース取得 + PDF URL 抽出 ===
+def fetch_university_news():
+    news_results = []
+    pdf_urls = []
+
+    for site in UNIVERSITY_SITES:
+        name = site["name"]
+        url = site["url"]
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+        except Exception as e:
+            news_results.append(f"【{name}】ニュース取得エラー: {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links = soup.find_all("a", href=True)
+        count = 0
+        for a in links:
+            href = a["href"]
+            title = a.get_text(strip=True)
+            if not title or len(title) < 10:
+                continue
+
+            if href.startswith("/"):
+                base = url.rstrip("/")
+                href = base + href
+
+            if href.lower().endswith(".pdf"):
+                pdf_urls.append(href)
+
+            if count < 3:
+                summary = summarize(title, context=f"{name} 研究ニュース（タイトルベース）")
+                news_results.append(f"【{name}】{summary}\nURL: {href}")
+                count += 1
+            else:
+                break
+
+    return news_results, pdf_urls
+
+
+# === E. PDF 自動ダウンロード → AI要約 ===
+def summarize_pdfs(pdf_urls, max_pdfs=3):
+    summaries = []
+    for i, url in enumerate(pdf_urls[:max_pdfs]):
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            pdf_bytes = BytesIO(resp.content)
+            reader = PdfReader(pdf_bytes)
+
+            # 最初の数ページだけからテキスト抽出（重すぎ防止）
+            text = ""
+            for page in reader.pages[:3]:
+                text += page.extract_text() or ""
+
+            if not text.strip():
+                summaries.append(f"PDF要約失敗（テキスト抽出不可）: {url}")
+                continue
+
+            summary = summarize(text[:6000], context="PDF技術資料")
+            summaries.append(f"◆ PDF 要約\n{summary}\nURL: {url}")
+        except Exception as e:
+            summaries.append(f"PDF取得/要約エラー: {e}\nURL: {url}")
+    return summaries
+
+
 # === GitHub Issue 作成 ===
 def create_issue(title, body):
-    url = f"https://api.github.com/repos/{REPO}/issues"
+    api_url = f"https://api.github.com/repos/{REPO}/issues"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     data = {"title": title, "body": body}
-    resp = requests.post(url, headers=headers, json=data)
+    resp = requests.post(api_url, headers=headers, json=data)
     if resp.status_code >= 300:
         print("ERROR:", resp.status_code, resp.text)
         resp.raise_for_status()
@@ -99,28 +225,56 @@ def create_issue(title, body):
 
 # === Main ===
 if __name__ == "__main__":
-    # A. キーワード一致の論文
+    # A. arXiv キーワードマッチ
     keyword_results = fetch_keyword_matches()
 
-    # B. 最新3件
+    # B. arXiv 最新3件
     latest_three_results = fetch_latest_three()
 
-    # Issue タイトル
+    # C. メーカー技術ニュース
+    manufacturer_news, manufacturer_pdfs = fetch_manufacturer_news()
+
+    # D. 大学ニュース
+    university_news, university_pdfs = fetch_university_news()
+
+    # E. PDF 要約（メーカー + 大学から拾ったPDF）
+    pdf_summaries = summarize_pdfs(manufacturer_pdfs + university_pdfs, max_pdfs=3)
+
+    # Issueタイトル
     today = datetime.now().strftime("%Y-%m-%d")
     title = f"電子顕微鏡論文ウォッチ {today}"
 
-    # Issue 本文
-    body = ""
+    # Issue本文構成
+    body_parts = []
 
-    body += "## 🔍 キーワードマッチ論文（電子顕微鏡関連）\n"
+    body_parts.append("## 🔍 キーワードマッチ論文（電子顕微鏡関連）")
     if keyword_results:
-        body += "\n".join(keyword_results)
+        body_parts.append("\n".join(keyword_results))
     else:
-        body += "該当なし\n"
+        body_parts.append("該当なし")
 
-    body += "\n\n---\n\n"
-    body += "## 🆕 最新のarXiv論文（新着3件）\n"
-    body += "\n".join(latest_three_results)
+    body_parts.append("\n\n---\n\n## 🆕 最新のarXiv論文（新着3件）")
+    body_parts.append("\n".join(latest_three_results))
 
-    # Issueを作成
+    body_parts.append("\n\n---\n\n## 🏭 メーカー技術ニュース（JEOL / Thermo / Hitachi）")
+    if manufacturer_news:
+        body_parts.append("\n".join(manufacturer_news))
+    else:
+        body_parts.append("ニュース取得なし")
+
+    body_parts.append("\n\n---\n\n## 🏛 国内大学・研究機関ニュース（東大・京大・東北大・阪大・九大 ほか）")
+    if university_news:
+        body_parts.append("\n".join(university_news))
+    else:
+        body_parts.append("ニュース取得なし")
+
+    body_parts.append("\n\n---\n\n## 📄 新着PDFの要約（メーカー + 大学）")
+    if pdf_summaries:
+        body_parts.append("\n".join(pdf_summaries))
+    else:
+        body_parts.append("新着PDFなし")
+
+    body = "\n".join(body_parts)
+
+    # Issue 作成
     create_issue(title, body)
