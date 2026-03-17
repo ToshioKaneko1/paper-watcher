@@ -2,7 +2,7 @@ name: Arxiv watcher
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # JST 09:00 に相当（UTC 0:00）
+    - cron: "0 0 * * *"   # JST 09:00
   workflow_dispatch:
 
 jobs:
@@ -24,6 +24,6 @@ jobs:
       - name: Run script
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          PAPER_WATCHER_TOKEN: ${{ secrets.PAPER_WATCHER_TOKEN }}
-          GITHUB_REPO: ${{ secrets.GITHUB_REPO }}
+          TOKEN_1: ${{ secrets.TOKEN_1 }}
+          REPO: ${{ secrets.REPO }}
         run: python watch.py
