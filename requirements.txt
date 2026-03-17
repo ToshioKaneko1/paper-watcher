@@ -1,3 +1,5 @@
-openai
+openai==0.28
 feedparser
 requests
+beautifulsoup4
+PyPDF2
