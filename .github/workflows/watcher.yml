@@ -28,7 +28,7 @@ jobs:
       # ★ スクリプト実行（Secrets を環境変数として渡す）
       - name: Run script
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   # ← 日本語要約に使用
+          HUGGINGFACE_API_TOKEN: ${{ secrets.HUGGINGFACE_API_TOKEN }}  # ← 日本語要約に使用
           TOKEN_1: ${{ secrets.TOKEN_1 }}                 # ← GitHub Issues 作成用 PAT
           REPO: ${{ secrets.REPO }}                       # ← "username/reponame"
         run: python watch.py
