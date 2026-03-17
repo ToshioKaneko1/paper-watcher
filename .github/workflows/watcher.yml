@@ -1,0 +1,6 @@
+- name: Run script
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PAPER_WATCHER_TOKEN: ${{ secrets.PAPER_WATCHER_TOKEN }}
+          GITHUB_REPO: ${{ secrets.GITHUB_REPO }}
+        run: python watch.py
