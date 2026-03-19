@@ -2,8 +2,10 @@
 """
 watch.py
 Electron microscopy arXiv watcher
-- Fetch papers
-- Create GitHub Issue if papers are found
+
+- TEM / STEM / SEM を必須条件に広く収集
+- EELS / 4D-STEM などは加点評価
+- 該当論文があれば GitHub Issue を自動作成
 """
 
 import feedparser
@@ -16,7 +18,7 @@ from typing import List
 # GitHub settings
 # =========================
 
-GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # owner/repo
+GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # "owner/repo"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 # =========================
@@ -49,6 +51,10 @@ EM_METHOD_KEYWORDS = {
     "tomography": 1.5,
     "dpc": 1.5,
     "ebsd": 1.2,
+    "in-situ": 1.2,
+    "cryo-em": 1.2,
+    "diffraction": 1.0,
+    "haadf": 1.0,
 }
 
 NEGATIVE_KEYWORDS = [
@@ -57,6 +63,7 @@ NEGATIVE_KEYWORDS = [
     "propulsion",
     "fission",
     "astrophysics",
+    "cosmic",
 ]
 
 # =========================
@@ -71,8 +78,8 @@ def contains_negative(text: str) -> bool:
     text = text.lower()
     return any(k in text for k in NEGATIVE_KEYWORDS)
 
-def score_em(text: str) -> float:
-    score = 5.0
+def electron_microscopy_score(text: str) -> float:
+    score = 5.0  # base score
     text = text.lower()
     for k, w in EM_METHOD_KEYWORDS.items():
         if k in text:
@@ -98,7 +105,7 @@ def fetch_papers():
         papers.append({
             "title": e.title.replace("\n", " "),
             "link": e.link,
-            "score": score_em(text),
+            "score": electron_microscopy_score(text),
         })
 
     papers.sort(key=lambda x: x["score"], reverse=True)
@@ -110,18 +117,56 @@ def fetch_papers():
 
 def create_issue(papers):
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        raise RuntimeError("GitHub token or repository not set")
+        raise RuntimeError("GITHUB_TOKEN or GITHUB_REPOSITORY is not set")
 
     today = datetime.date.today().isoformat()
     title = f"Electron Microscopy Papers ({today})"
 
     body_lines = [
-        "## 🧪 New Electron Microscopy Papers\n"
+        "## 🧪 New Electron Microscopy Papers",
+        ""
     ]
 
     for p in papers:
         body_lines.append(
-            f"- **[{p['title']}]({p['link']})**  \n"
-            f"  EM score: {p['score']:.1f}\n"
+            f"- [{p['link']}]({p['link']})  \n"
+            f"  EM score: {p['score']:.1f}"
         )
 
+    body = "\n".join(body_lines)
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    r = requests.post(url, headers=headers, json={
+        "title": title,
+        "body": body,
+        "labels": ["electron-microscopy", "arxiv-watch"]
+    })
+
+    # デバッグ用（Actions ログに必ず出る）
+    print("GitHub issue POST status:", r.status_code)
+    print("GitHub response:", r.text)
+
+    if r.status_code != 201:
+        raise RuntimeError("Issue creation failed")
+
+# =========================
+# Main
+# =========================
+
+def main():
+    papers = fetch_papers()
+
+    if not papers:
+        print("No relevant electron microscopy papers found.")
+        return
+
+    create_issue(papers)
+    print(f"Created issue with {len(papers)} papers.")
+
+if __name__ == "__main__":
+    main()
