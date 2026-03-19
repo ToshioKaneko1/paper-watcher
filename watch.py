@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
 watch.py (improved)
-- Broad EM search: TEM / STEM / SEM
-- Pick: 1 paper from priority institutions + 5 other EM papers
-- Create GitHub Issue using TOKEN_1 / REPO (no GITHUB_* env vars)
-- Safe arXiv URL building via urlencode (avoid InvalidURL)
+
+Goal:
+- Broad EM search (TEM/STEM/SEM) from arXiv
+- Output: 1 paper from PRIORITY institutions (must be EM-related)
+          + 5 other EM-related papers
+- Post to GitHub Issues using TOKEN_1 / REPO (no GITHUB_* env vars)
+- arXiv URL safely built via urlencode
+
+Notes:
+- arXiv API metadata does not reliably include affiliation for all authors.
+- We optionally parse the first page of PDF to detect affiliations (heuristic).
 """
 
 import datetime
@@ -12,11 +19,19 @@ import io
 import os
 import re
 import sys
+from typing import List, Dict
 from urllib.parse import urlencode
 
 import feedparser
 import requests
-from PyPDF2 import PdfReader  # or use pypdf
+
+# PDF text extraction (for affiliation heuristics)
+try:
+    from PyPDF2 import PdfReader
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
 
 # =========================
 # 0) Environment variables (NO "GITHUB_*")
@@ -24,33 +39,37 @@ from PyPDF2 import PdfReader  # or use pypdf
 TOKEN_1 = os.environ.get("TOKEN_1")   # GitHub Issues 作成用 PAT
 REPO = os.environ.get("REPO")         # "username/reponame"
 
+
 # =========================
 # 1) arXiv query (safe URL encoding)
 # =========================
 ARXIV_BASE_URL = "https://export.arxiv.org/api/query?"
 
-# 電子顕微鏡を広く拾う（必須軸）
+# Broad EM query (retrieval stage) - keep broad, filter later in code
 ARXIV_SEARCH_QUERY = "all:electron+microscopy OR all:TEM OR all:STEM OR all:SEM"
 
 ARXIV_PARAMS = {
     "search_query": ARXIV_SEARCH_QUERY,
     "start": 0,
-    "max_results": 80,  # ←候補を多めに取って、後で 1+5 に絞る
+    "max_results": 100,          # fetch more candidates, then select 1+5
     "sortBy": "submittedDate",
     "sortOrder": "descending",
 }
 ARXIV_URL = ARXIV_BASE_URL + urlencode(ARXIV_PARAMS)
 
+
 # =========================
-# 2) Filtering / scoring keywords
+# 2) EM topic detection
 # =========================
+# Base EM tokens
 EM_CORE_KEYWORDS = [
     "electron microscopy",
-    "tem", "stem", "sem",
     "transmission electron",
     "scanning electron",
+    "tem", "stem", "sem",
 ]
 
+# Optional method tokens (scoring only; not filtering)
 EM_METHOD_KEYWORDS = {
     "eels": 2.0,
     "4d-stem": 2.0,
@@ -66,19 +85,56 @@ EM_METHOD_KEYWORDS = {
     "diffraction": 1.0,
 }
 
+# Mild negative filters (to reduce obvious drift)
 NEGATIVE_KEYWORDS = [
-    "nuclear reactor",
-    "rocket",
-    "propulsion",
-    "fission",
-    "astrophysics",
-    "cosmic",
+    "nuclear reactor", "fission", "rocket", "propulsion",
+    "astrophysics", "cosmic", "stellar"
 ]
 
+
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    t = text.lower()
+    return any(k.lower() in t for k in keywords)
+
+
+def _contains_negative(text: str) -> bool:
+    t = text.lower()
+    return any(k.lower() in t for k in NEGATIVE_KEYWORDS)
+
+
+def em_score(title: str, abstract: str) -> float:
+    """Score how strongly this looks like an EM method paper."""
+    t = (title + " " + abstract).lower()
+    score = 5.0  # base
+    for k, w in EM_METHOD_KEYWORDS.items():
+        if k in t:
+            score += w
+    # Slight boost if the title itself mentions EM explicitly
+    title_l = title.lower()
+    if "electron microscopy" in title_l or "tem" in title_l or "stem" in title_l or "sem" in title_l:
+        score += 1.0
+    return score
+
+
+def is_em_paper_strict(title: str, abstract: str) -> bool:
+    """
+    Stricter EM-topic filter:
+    - Must mention EM core tokens in TITLE OR in the beginning of abstract (first ~300 chars)
+    This prevents 'TEM mentioned once in related work' papers from passing.
+    """
+    title_l = title.lower()
+    abs_l = abstract.lower()
+    abs_head = abs_l[:300]
+
+    in_title = any(k in title_l for k in ["electron microscopy", "tem", "stem", "sem", "transmission electron", "scanning electron"])
+    in_abs_head = any(k in abs_head for k in ["electron microscopy", "tem", "stem", "sem", "transmission electron", "scanning electron"])
+
+    return in_title or in_abs_head
+
+
 # =========================
-# 3) Priority institution keywords
+# 3) Priority institution patterns
 # =========================
-# ※ここは「ゆるい文字一致」でOK。まず運用して、漏れたら追加していくのが安定です。
 PRIORITY_AFFIL_PATTERNS = [
     # Japan universities
     r"\buniversity of tokyo\b", r"\butokyo\b", r"東京大学",
@@ -89,13 +145,14 @@ PRIORITY_AFFIL_PATTERNS = [
     r"\btohoku university\b", r"東北大学",
     r"\bhokkaido university\b", r"北海道大学",
 
-    # Japan institutes / companies (examples)
-    r"\bnims\b", r"物質・材料研究機構", r"nims\b",
-    r"\baist\b", r"産業技術総合研究所",
+    # Japan institutes / orgs
+    r"\bnims\b", r"物質・材料研究機構", r"national institute for materials science",
+    r"\baist\b", r"産業技術総合研究所", r"national institute of advanced industrial science and technology",
+    r"\bjfcc\b", r"ファインセラミックスセンター", r"fine ceramics center",
+
+    # Companies / vendors (EM-related)
     r"\bjeol\b", r"日本電子",
     r"\bhitachi\b", r"日立",
-    r"\bthermo fisher\b", r"\btfs\b",  # 参考（THSは表記ゆれが多いので暫定）
-    r"\bjfcc\b", r"ファインセラミックスセンター", r"fine ceramics center",
 
     # Semiconductor companies (examples)
     r"\bsamsung\b", r"サムスン",
@@ -111,45 +168,28 @@ PRIORITY_AFFIL_PATTERNS = [
 PRIORITY_RE = re.compile("|".join(PRIORITY_AFFIL_PATTERNS), re.IGNORECASE)
 
 
-# =========================
-# 4) Utility
-# =========================
-def contains_any(text: str, keywords):
-    t = text.lower()
-    return any(k.lower() in t for k in keywords)
-
-def contains_negative(text: str):
-    t = text.lower()
-    return any(k.lower() in t for k in NEGATIVE_KEYWORDS)
-
-def em_score(text: str) -> float:
-    t = text.lower()
-    score = 5.0
-    for k, w in EM_METHOD_KEYWORDS.items():
-        if k in t:
-            score += w
-    return score
-
 def is_priority_affiliation(text: str) -> bool:
     if not text:
         return False
     return PRIORITY_RE.search(text) is not None
 
+
+# =========================
+# 4) arXiv helpers
+# =========================
 def arxiv_id_from_entry(entry) -> str:
     # entry.id: "http://arxiv.org/abs/xxxx.xxxxxv1"
     return entry.id.split("/abs/")[-1].strip()
 
+
 def pdf_url_from_entry(entry) -> str:
-    # arXivは /pdf/{id}.pdf で取得可能
     arxiv_id = arxiv_id_from_entry(entry)
     return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
 
-def extract_affiliation_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Get likely affiliation text from first page of PDF.
-    (Heuristic: just return first page text; we'll match patterns against it.)
-    """
+def extract_first_page_text(pdf_bytes: bytes) -> str:
+    if not PDF_AVAILABLE:
+        return ""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         if len(reader.pages) == 0:
@@ -161,79 +201,88 @@ def extract_affiliation_from_pdf(pdf_bytes: bytes) -> str:
 
 
 # =========================
-# 5) Fetch papers and classify
+# 5) Fetch & classify candidates
 # =========================
-def fetch_candidates():
+def fetch_candidates() -> List[Dict]:
     feed = feedparser.parse(ARXIV_URL)
-    items = []
+    items: List[Dict] = []
 
     for entry in getattr(feed, "entries", []):
         title = entry.title.replace("\n", " ").strip()
         abstract = entry.summary.replace("\n", " ").strip()
-        link_abs = entry.link
-        text = f"{title} {abstract}"
 
-        # 必須：電子顕微鏡関連
-        if not contains_any(text, EM_CORE_KEYWORDS):
+        # mild negatives first
+        if _contains_negative(title + " " + abstract):
             continue
 
-        # 除外（軽め）
-        if contains_negative(text):
+        # STRICT EM filter: this is the key fix
+        if not is_em_paper_strict(title, abstract):
             continue
 
-        score = em_score(text)
-
-        # affiliation は arXiv metadata に「任意の自由記述」として入る場合があるが、常に揃わない
-        # → PDF からも拾って判定する（頑健化）
-        aff_text = ""
-        # feedparserが arxiv_affiliation を拾う場合もある（ただし完全ではない）
-        aff_text = getattr(entry, "arxiv_affiliation", "") or ""
-
-        # PDF から補強（最大でも候補数分だけ。多すぎる場合は max_results を減らす）
-        pdf_url = pdf_url_from_entry(entry)
-        pdf_text = ""
-        try:
-            r = requests.get(pdf_url, timeout=20)
-            if r.status_code == 200 and r.content:
-                pdf_text = extract_affiliation_from_pdf(r.content)
-        except Exception:
-            pdf_text = ""
-
-        combined_aff = f"{aff_text} {pdf_text}".strip()
+        score = em_score(title, abstract)
 
         items.append({
             "title": title,
-            "abs": link_abs,
-            "pdf": pdf_url,
-            "score": score,
-            "aff_text": combined_aff,
-            "is_priority": is_priority_affiliation(combined_aff),
+            "abstract": abstract,
+            "abs": entry.link,
+            "pdf": pdf_url_from_entry(entry),
             "published": getattr(entry, "published", "")[:10],
+            "score": score,
+            # affiliation text will be filled later (optional)
+            "aff_text": getattr(entry, "arxiv_affiliation", "") or "",
+            "is_priority": False,
         })
 
-    # score順
+    # sort by score desc
     items.sort(key=lambda x: x["score"], reverse=True)
     return items
 
 
-def pick_1_plus_5(items):
+def enrich_affiliations_for_top(items: List[Dict], max_pdf: int = 25) -> None:
+    """
+    Download PDFs only for top-N candidates (to reduce traffic),
+    and use first page text for priority affiliation detection.
+    """
+    if not PDF_AVAILABLE:
+        # fallback to whatever arXiv metadata provides
+        for it in items:
+            it["is_priority"] = is_priority_affiliation(it.get("aff_text", ""))
+        return
+
+    for i, it in enumerate(items[:max_pdf]):
+        pdf_text = ""
+        try:
+            r = requests.get(it["pdf"], timeout=25)
+            if r.status_code == 200 and r.content:
+                pdf_text = extract_first_page_text(r.content)
+        except Exception:
+            pdf_text = ""
+
+        combined = (it.get("aff_text", "") + " " + pdf_text).strip()
+        it["aff_text"] = combined
+        it["is_priority"] = is_priority_affiliation(combined)
+
+    # For the rest, rely on existing aff_text only
+    for it in items[max_pdf:]:
+        it["is_priority"] = is_priority_affiliation(it.get("aff_text", ""))
+
+
+def pick_1_plus_5(items: List[Dict]):
+    # IMPORTANT: items are already EM-only due to strict filter
     priority = [x for x in items if x["is_priority"]]
     others = [x for x in items if not x["is_priority"]]
 
-    top_priority = priority[:1]  # 1件
-    # もし注目1件を取ったなら、others から同じ論文が紛れないように除外（念のため）
-    used_abs = set(x["abs"] for x in top_priority)
-    others_filtered = [x for x in others if x["abs"] not in used_abs]
-
-    top_others = others_filtered[:5]  # 5件
+    top_priority = priority[:1]
+    used = set(x["abs"] for x in top_priority)
+    top_others = [x for x in others if x["abs"] not in used][:5]
 
     return top_priority, top_others
 
 
 # =========================
-# 6) Create GitHub Issue (TOKEN_1 / REPO)
+# 6) GitHub Issue creation (TOKEN_1 / REPO)
 # =========================
-def create_issue(top_priority, top_others):
+def create_issue(top_priority: List[Dict], top_others: List[Dict]) -> None:
     if not TOKEN_1:
         print("[WARN] TOKEN_1 not set -> skip issue creation")
         return
@@ -245,7 +294,7 @@ def create_issue(top_priority, top_others):
     issue_title = f"Electron Microscopy Watch ({today})"
 
     lines = []
-    lines.append("## ⭐ 注目機関（最大1件）")
+    lines.append("## ⭐ 注目機関（電子顕微鏡関連・最大1件）")
     if top_priority:
         p = top_priority[0]
         lines.append(f"- **{p['title']}**")
@@ -254,10 +303,10 @@ def create_issue(top_priority, top_others):
         lines.append(f"  - score: {p['score']:.1f}")
         lines.append(f"  - published: {p['published']}")
     else:
-        lines.append("- 該当なし（今回の候補から注目機関の所属検出ができませんでした）")
+        lines.append("- 該当なし（注目機関×電子顕微鏡の条件を満たす論文が見つかりませんでした）")
 
     lines.append("")
-    lines.append("## 📚 その他（最大5件）")
+    lines.append("## 📚 その他（電子顕微鏡関連・最大5件）")
     if top_others:
         for p in top_others:
             lines.append(f"- **{p['title']}**")
@@ -295,14 +344,15 @@ def main():
     print("[INFO] arXiv URL:", ARXIV_URL)
 
     items = fetch_candidates()
-    print(f"[INFO] candidates: {len(items)}")
+    print(f"[INFO] EM candidates (strict): {len(items)}")
+
+    # affiliation enrichment for top N only
+    enrich_affiliations_for_top(items, max_pdf=25)
 
     top_priority, top_others = pick_1_plus_5(items)
     print(f"[INFO] picked priority: {len(top_priority)}, others: {len(top_others)}")
 
-    # Issueに出す
     create_issue(top_priority, top_others)
-
     print("[INFO] watch.py finished normally")
 
 
