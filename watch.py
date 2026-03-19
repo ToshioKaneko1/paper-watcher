@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-watch.py (final)
+watch.py (Tech Spotlight edition)
 
 Output:
-  - Priority (max 1): EM-related paper where affiliation text indicates an EM-strong institution/facility
-  - Others (max 5): EM-focused papers from the remaining set
-
-Key changes:
-  - Priority is NOT limited to a short manual institution list.
-  - Priority is detected by "EM facility/institution keywords" in affiliation-like text
-    (from arXiv metadata + PDF first page text when available).
+  - 1 paper: Tech Spotlight (advanced EM techniques)
+  - 5 papers: General EM (TEM/STEM/SEM/electron microscopy)
 
 Env vars (NO GITHUB_*):
   - TOKEN_1 : GitHub PAT for creating issues
@@ -17,22 +12,13 @@ Env vars (NO GITHUB_*):
 """
 
 import datetime
-import io
 import os
-import re
 import sys
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from urllib.parse import urlencode
 
 import feedparser
 import requests
-
-# PDF (affiliation detection support)
-try:
-    from PyPDF2 import PdfReader
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
 
 # =========================
 # Env vars (NO "GITHUB_*")
@@ -41,7 +27,7 @@ TOKEN_1 = os.environ.get("TOKEN_1")   # GitHub PAT
 REPO = os.environ.get("REPO")         # "username/reponame"
 
 # =========================
-# arXiv query
+# arXiv query (safe URL)
 # =========================
 ARXIV_BASE_URL = "https://export.arxiv.org/api/query?"
 ARXIV_SEARCH_QUERY = "all:electron+microscopy OR all:TEM OR all:STEM OR all:SEM"
@@ -49,170 +35,156 @@ ARXIV_SEARCH_QUERY = "all:electron+microscopy OR all:TEM OR all:STEM OR all:SEM"
 ARXIV_PARAMS = {
     "search_query": ARXIV_SEARCH_QUERY,
     "start": 0,
-    "max_results": 150,           # broaden candidate pool
+    "max_results": 200,
     "sortBy": "submittedDate",
     "sortOrder": "descending",
 }
 ARXIV_URL = ARXIV_BASE_URL + urlencode(ARXIV_PARAMS)
 
 # =========================
-# EM判定（厳格/緩め）
+# Filters
 # =========================
-EM_STRICT_KEYWORDS = [
+NEGATIVE_KEYWORDS = [
+    "nuclear reactor", "fission", "rocket", "propulsion",
+    "astrophysics", "cosmic", "stellar"
+]
+
+# "General EM" gate (broad but real)
+EM_CORE_KEYWORDS = [
     "electron microscopy",
     "transmission electron",
     "scanning electron",
     "tem", "stem", "sem",
 ]
 
-# Priority枠は「EM関連技術」まで拾うため、手法キーワードも許容
-EM_LOOSE_KEYWORDS = EM_STRICT_KEYWORDS + [
-    "eels", "edx", "ebsd", "haadf", "4d-stem", "dpc", "ptychography", "tomography"
-]
+# =========================
+# Tech Spotlight keywords (your request)
+# =========================
+# Each entry: keyword variants -> weight
+TECH_KEYWORDS = {
+    # Monochromated / monochromator EELS
+    "Monochromated EELS": ([
+        "monochromated eels", "monochromated", "monochromator",
+        "monochromatic eels"
+    ], 4.0),
 
-NEGATIVE_KEYWORDS = [
-    "nuclear reactor", "fission", "rocket", "propulsion",
-    "astrophysics", "cosmic", "stellar"
-]
+    # 4D-STEM
+    "4D-STEM": ([
+        "4d-stem", "4d stem", "four-dimensional stem", "4dstem",
+        "4d scanning transmission"
+    ], 4.0),
 
-EM_METHOD_KEYWORDS = {
-    "eels": 2.0,
-    "4d-stem": 2.0,
-    "dpc": 1.5,
-    "ptychography": 1.5,
-    "tomography": 1.5,
-    "ebsd": 1.2,
-    "edx": 1.2,
-    "haadf": 1.0,
-    "bf-stem": 1.0,
-    "in-situ": 1.2,
-    "cryo-em": 1.2,
-    "diffraction": 1.0,
+    # VEELS
+    "VEELS": ([
+        "veels", "valence eels", "valence electron energy loss"
+    ], 3.5),
+
+    # Vibrational EELS
+    "Vibrational EELS": ([
+        "vibrational eels", "phonon eels", "vibrational spectroscopy eels",
+        "aloof eels", "phonon spectroscopy"
+    ], 4.0),
+
+    # High-res STEM-EDX/EDS
+    "High-res STEM-EDX": ([
+        "stem-edx", "stem edx", "atomic-resolution edx", "atomic resolution edx",
+        "stem-eds", "stem eds", "atomic-resolution eds", "x-ray mapping",
+        "high resolution edx", "high-resolution edx"
+    ], 3.5),
+
+    # Damage-less / low-dose
+    "Damage-less / Low-dose": ([
+        "low dose", "dose-efficient", "dose efficiency", "damage-free",
+        "beam sensitive", "beam-sensitive", "radiation damage", "damage mitigation",
+        "cryo", "cryogenic"
+    ], 3.0),
+
+    # Phase contrast / phase imaging
+    "Phase contrast": ([
+        "phase contrast", "phase-contrast", "phase imaging",
+        "electron holography", "off-axis holography",
+        "dpc", "differential phase contrast"
+    ], 3.0),
+
+    # Ptychography
+    "Ptychography": ([
+        "ptychography", "electron ptychography", "ptychographic", "4d ptychography"
+    ], 4.0),
 }
 
-def contains_any(text: str, keywords: List[str]) -> bool:
-    t = text.lower()
-    return any(k in t for k in keywords)
+# Extra signals that indicate "method paper"
+METHOD_SIGNALS = {
+    "algorithm": 0.8,
+    "method": 0.8,
+    "framework": 0.6,
+    "instrumentation": 0.8,
+    "detector": 0.8,
+    "aberration-corrected": 0.8,
+    "aberration corrected": 0.8,
+}
+
 
 def contains_negative(text: str) -> bool:
     t = text.lower()
-    return any(k.lower() in t for k in NEGATIVE_KEYWORDS)
+    return any(k in t for k in NEGATIVE_KEYWORDS)
 
-def is_em_strict(title: str, abstract: str) -> bool:
-    t = (title + " " + abstract).lower()
-    return contains_any(t, EM_STRICT_KEYWORDS)
 
-def is_em_loose(title: str, abstract: str) -> bool:
+def is_em_paper(title: str, abstract: str) -> bool:
     t = (title + " " + abstract).lower()
-    return contains_any(t, EM_LOOSE_KEYWORDS)
+    return any(k in t for k in EM_CORE_KEYWORDS)
+
 
 def em_score(title: str, abstract: str) -> float:
-    """Ranking score (method-rich EM papers bubble up)."""
+    """General EM ranking score."""
     t = (title + " " + abstract).lower()
-    score = 5.0
-    for k, w in EM_METHOD_KEYWORDS.items():
+    score = 0.0
+
+    # core mention boosts
+    for k in EM_CORE_KEYWORDS:
+        if k in t:
+            score += 1.0
+
+    # method signals
+    for k, w in METHOD_SIGNALS.items():
         if k in t:
             score += w
-    # small boost if explicitly EM in title
+
+    # title boost
     tl = title.lower()
-    if "electron microscopy" in tl or " tem" in (" " + tl) or " stem" in (" " + tl) or " sem" in (" " + tl):
+    if "electron microscopy" in tl or "tem" in tl or "stem" in tl or "sem" in tl:
         score += 1.0
+
     return score
 
-# =========================
-# Priority detection (NEW)
-# =========================
-# 1) “EMに強い拠点/施設/センター”を示す語（世界共通で効く）
-EM_INSTITUTION_KEYWORDS = [
-    "microscopy center",
-    "microscopy centre",
-    "microscopy facility",
-    "electron microscopy center",
-    "electron microscopy centre",
-    "electron microscopy facility",
-    "electron microscopy laboratory",
-    "electron microscopy lab",
-    "microanalysis center",
-    "microanalysis facility",
-    "nanocharacterization",
-    "nanoscopy",
-    "imaging center",
-    "imaging facility",
-    "cryo-em facility",
-    "cryo electron microscopy facility",
-    "national center for electron microscopy",
-    "molecular foundry",
-    "center for nanoscale materials",
-]
 
-EM_INST_RE = re.compile("|".join(re.escape(k) for k in EM_INSTITUTION_KEYWORDS), re.IGNORECASE)
+def tech_score(title: str, abstract: str) -> Tuple[float, List[str]]:
+    """
+    Tech Spotlight score + matched labels.
+    """
+    t = (title + " " + abstract).lower()
+    score = 0.0
+    matched = []
 
-def is_em_strong_institution(text: str) -> bool:
-    """Priority if affiliation-like text contains EM facility keywords."""
-    if not text:
-        return False
-    return EM_INST_RE.search(text) is not None
+    for label, (variants, w) in TECH_KEYWORDS.items():
+        if any(v in t for v in variants):
+            score += w
+            matched.append(label)
 
-# 2) あなたが挙げた注目機関も“追加ブースト”として残す（少なくてもOK）
-#    これだけに頼らないのが今回の肝
-MANUAL_PRIORITY_PATTERNS = [
-    # Japan universities / institutes / companies (examples)
-    r"university of tokyo|東京大学",
-    r"osaka university|大阪大学",
-    r"kyoto university|京都大学",
-    r"nagoya university|名古屋大学",
-    r"kyushu university|九州大学",
-    r"tohoku university|東北大学",
-    r"hokkaido university|北海道大学",
-    r"\bnims\b|物質・材料研究機構|national institute for materials science",
-    r"\baist\b|産業技術総合研究所|national institute of advanced industrial science and technology",
-    r"\bjeol\b|日本電子",
-    r"\bhitachi\b|日立",
-    r"\bjfcc\b|ファインセラミックスセンター|fine ceramics center",
-    r"\bsamsung\b|サムスン",
-    r"\btoshiba\b|東芝",
-    r"\bkioxia\b|toshiba memory|キオクシア",
-    r"\bmit\b|massachusetts institute of technology",
-    r"columbia university",
-    r"university of california|uc berkeley|ucla|uc san diego",
-]
-MANUAL_PRI_RE = re.compile("|".join(MANUAL_PRIORITY_PATTERNS), re.IGNORECASE)
+    # small extra for being explicitly methodological
+    for k, w in METHOD_SIGNALS.items():
+        if k in t:
+            score += 0.2 * w
 
-def is_manual_priority(text: str) -> bool:
-    if not text:
-        return False
-    return MANUAL_PRI_RE.search(text) is not None
+    return score, matched
 
-def is_priority(text: str) -> bool:
-    """Final priority rule: EM-strong institution keywords OR manual list match."""
-    return is_em_strong_institution(text) or is_manual_priority(text)
 
-# =========================
-# arXiv helpers
-# =========================
 def arxiv_id(entry) -> str:
     return entry.id.split("/abs/")[-1].strip()
 
-def pdf_url(entry) -> str:
-    return f"https://arxiv.org/pdf/{arxiv_id(entry)}.pdf"
 
-def extract_first_page_text(pdf_bytes: bytes) -> str:
-    if not PDF_AVAILABLE:
-        return ""
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        if reader.pages:
-            return (reader.pages[0].extract_text() or "").replace("\n", " ")
-    except Exception:
-        pass
-    return ""
-
-# =========================
-# Fetch candidates
-# =========================
 def fetch_candidates() -> List[Dict]:
     feed = feedparser.parse(ARXIV_URL)
-    items: List[Dict] = []
+    items = []
 
     for e in getattr(feed, "entries", []):
         title = e.title.replace("\n", " ").strip()
@@ -221,72 +193,46 @@ def fetch_candidates() -> List[Dict]:
         if contains_negative(title + " " + abstract):
             continue
 
-        em_strict_flag = is_em_strict(title, abstract)
-        em_loose_flag = is_em_loose(title, abstract)
-        if not (em_strict_flag or em_loose_flag):
+        if not is_em_paper(title, abstract):
             continue
+
+        ems = em_score(title, abstract)
+        tscore, matched = tech_score(title, abstract)
 
         items.append({
             "title": title,
-            "abstract": abstract,
             "abs": e.link,
-            "pdf": pdf_url(e),
+            "pdf": f"https://arxiv.org/pdf/{arxiv_id(e)}.pdf",
             "published": getattr(e, "published", "")[:10],
-            "score": em_score(title, abstract),
-            "em_strict": em_strict_flag,
-            "em_loose": em_loose_flag,
-            "aff_text": (getattr(e, "arxiv_affiliation", "") or "").strip(),
-            "priority": False,
+            "em_score": ems,
+            "tech_score": tscore,
+            "tech_matched": matched,
         })
 
-    items.sort(key=lambda x: x["score"], reverse=True)
+    # sort by EM score for general pool
+    items.sort(key=lambda x: (x["em_score"], x["tech_score"]), reverse=True)
     return items
 
-def enrich_affiliations_and_priority(items: List[Dict], max_pdf: int = 30) -> None:
+
+def pick_spotlight_and_general(items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    Download PDFs only for top-N candidates to reduce traffic.
-    Use first page text to detect priority institutions more robustly.
+    Spotlight: highest tech_score (>0)
+    General: top 5 by em_score excluding spotlight
     """
-    for it in items[:max_pdf]:
-        aff = it["aff_text"]
+    spotlight = []
+    candidates_spot = [x for x in items if x["tech_score"] > 0]
 
-        if PDF_AVAILABLE:
-            try:
-                r = requests.get(it["pdf"], timeout=25)
-                if r.status_code == 200 and r.content:
-                    aff += " " + extract_first_page_text(r.content)
-            except Exception:
-                pass
+    if candidates_spot:
+        # choose the strongest tech paper; tie-break by em_score
+        candidates_spot.sort(key=lambda x: (x["tech_score"], x["em_score"]), reverse=True)
+        spotlight = [candidates_spot[0]]
 
-        it["aff_text"] = aff.strip()
-        it["priority"] = is_priority(it["aff_text"])
+    used = {x["abs"] for x in spotlight}
+    general = [x for x in items if x["abs"] not in used][:5]
+    return spotlight, general
 
-    # Remaining items: priority by whatever aff_text exists
-    for it in items[max_pdf:]:
-        it["priority"] = is_priority(it["aff_text"])
 
-def pick_1_plus_5(items: List[Dict]):
-    """
-    Priority slot:
-      - must be EM-related (loose)
-      - and priority==True (EM-strong institution/facility OR manual list)
-
-    Others slot:
-      - must be EM-focused (strict)
-      - and priority==False (to keep diversity)
-    """
-    priority_pool = [x for x in items if x["priority"] and x["em_loose"]]
-    others_pool = [x for x in items if (not x["priority"]) and x["em_strict"]]
-
-    top_priority = priority_pool[:1]
-    used = {x["abs"] for x in top_priority}
-    top_others = [x for x in others_pool if x["abs"] not in used][:5]
-    return top_priority, top_others
-
-# =========================
-# Create GitHub Issue (TOKEN_1 / REPO)
-# =========================
-def create_issue(top_priority: List[Dict], top_others: List[Dict]) -> None:
+def create_issue(spotlight: List[Dict], general: List[Dict]) -> None:
     if not TOKEN_1:
         print("[WARN] TOKEN_1 not set -> skip issue creation")
         return
@@ -295,32 +241,31 @@ def create_issue(top_priority: List[Dict], top_others: List[Dict]) -> None:
         return
 
     today = datetime.date.today().isoformat()
-    issue_title = f"Electron Microscopy Watch ({today})"
+    issue_title = f"EM Tech Watch ({today})"
 
     lines = []
-    lines.append("## ⭐ 注目（EM拠点/施設・電子顕微鏡関連・最大1件）")
-    if top_priority:
-        p = top_priority[0]
+    lines.append("## ⭐ Tech Spotlight（注目“技術”・最大1件）")
+    if spotlight:
+        p = spotlight[0]
+        matched = ", ".join(p["tech_matched"]) if p["tech_matched"] else "(no label)"
+        lines.append(f"- **{p['title']}**")
+        lines.append(f"  - matched: {matched}")
+        lines.append(f"  - abs: {p['abs']}")
+        lines.append(f"  - pdf: {p['pdf']}")
+        lines.append(f"  - tech_score: {p['tech_score']:.1f} / em_score: {p['em_score']:.1f}")
+        lines.append(f"  - published: {p['published']}")
+    else:
+        lines.append("- 該当なし（今回の候補内で“注目技術”キーワードにヒットしませんでした）")
+
+    lines.append("")
+    lines.append("## 📚 General EM（電子顕微鏡関連・最大5件）")
+    for p in general:
         lines.append(f"- **{p['title']}**")
         lines.append(f"  - abs: {p['abs']}")
         lines.append(f"  - pdf: {p['pdf']}")
-        lines.append(f"  - score: {p['score']:.1f}")
+        lines.append(f"  - em_score: {p['em_score']:.1f} / tech_score: {p['tech_score']:.1f}")
         lines.append(f"  - published: {p['published']}")
-    else:
-        lines.append("- 該当なし（今回の候補内で「EM拠点/施設」判定にヒットしませんでした）")
-
-    lines.append("")
-    lines.append("## 📚 その他（電子顕微鏡関連・最大5件）")
-    if top_others:
-        for p in top_others:
-            lines.append(f"- **{p['title']}**")
-            lines.append(f"  - abs: {p['abs']}")
-            lines.append(f"  - pdf: {p['pdf']}")
-            lines.append(f"  - score: {p['score']:.1f}")
-            lines.append(f"  - published: {p['published']}")
-            lines.append("")
-    else:
-        lines.append("- 該当なし")
+        lines.append("")
 
     body = "\n".join(lines)
 
@@ -333,7 +278,7 @@ def create_issue(top_priority: List[Dict], top_others: List[Dict]) -> None:
         json={
             "title": issue_title,
             "body": body,
-            "labels": ["arxiv-watch", "electron-microscopy"],
+            "labels": ["arxiv-watch", "electron-microscopy", "tech-spotlight"],
         },
         timeout=30,
     )
@@ -342,24 +287,20 @@ def create_issue(top_priority: List[Dict], top_others: List[Dict]) -> None:
     if r.status_code not in (201, 200):
         print("[INFO] Issue response:", r.text)
 
-# =========================
-# Main (never exit 1)
-# =========================
+
 def main():
     print("[INFO] watch.py started")
     print("[INFO] arXiv URL:", ARXIV_URL)
-    print("[INFO] PDF_AVAILABLE:", PDF_AVAILABLE)
 
     items = fetch_candidates()
-    print(f"[INFO] candidates: {len(items)}")
+    print(f"[INFO] EM candidates: {len(items)}")
 
-    enrich_affiliations_and_priority(items, max_pdf=30)
+    spotlight, general = pick_spotlight_and_general(items)
+    print(f"[INFO] picked spotlight: {len(spotlight)}, general: {len(general)}")
 
-    top_priority, top_others = pick_1_plus_5(items)
-    print(f"[INFO] picked priority: {len(top_priority)}, others: {len(top_others)}")
-
-    create_issue(top_priority, top_others)
+    create_issue(spotlight, general)
     print("[INFO] watch.py finished normally")
+
 
 if __name__ == "__main__":
     try:
