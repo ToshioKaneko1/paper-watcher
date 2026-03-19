@@ -135,3 +135,12 @@ def main():
 if __name__ == "__main__":
     main()
     sys.exit(0)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("[ERROR] Unhandled exception occurred")
+        traceback.print_exc()
+    sys.exit(0)
