@@ -1,165 +1,96 @@
-import os
-import time
-import requests
-import feedparser
-from datetime import datetime
+# =========================
+# Electron Microscopy (EM) paper screener prompt (watch.py ready)
+# =========================
 
-# === Secrets from GitHub Actions ===
-HF_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")  # Hugging Face APIトークン (hf_...)
-REPO         = os.getenv("REPO")                   # "username/repo"
-GITHUB_TOKEN = os.getenv("TOKEN_1")                # GitHub PAT（Issues作成用）
+EM_SCREEN_PROMPT_TEMPLATE = r"""
+あなたは「電子顕微鏡（TEM/STEM/EELS/4D-STEM/DPC/ptychography/NBD/位相コントラスト等）」に特化した論文スクリーニング兼サマライザです。
+入力される論文のタイトルとアブストラクトを読んで、以下の要件を厳密に守って出力してください。
 
-# === arXiv キーワード（電子顕微鏡関連） ===
-KEYWORDS = [
-    "4D-STEM", "vibrational EELS", "monochromated EELS",
-    "phase contrast TEM", "DPC", "ptychography", "NBD"
-]
+# 目的
+- 電子顕微鏡の「新規技術」「手法」「計測・解析」「装置・検出器」「分解能改善」「エネルギー分解能改善」「位相・偏向計測」「スペクトロスコピー（EELS）」「4D-STEM/走査回折」に強く関連する論文だけを高精度で抽出する。
+- 特に次の注目領域を最優先で評価する：
+  1) vibrational EELS / phonon spectroscopy / aloof EELS
+  2) monochromated EELS / high energy resolution EELS / meV-EELS
+  3) 4D-STEM / diffraction imaging / scanning diffraction
+  4) phase contrast TEM / HRTEM / phase retrieval / exit-wave / holography
+  5) DPC / differential phase contrast / center-of-mass / beam deflection
+  6) ptychography / electron ptychography
+  7) NBD / nanobeam diffraction / precession electron diffraction (PED)
+  8) tomography / cryo-EM（ただしバイオ寄りで装置技術が薄い場合は厳しめに除外）
+- “材料科学一般”や“物性理論”“計算だけ”で、電子顕微鏡の手法・装置・計測に本質的に触れていないものは除外する。
 
-ARXIV_FEEDS = [
-    "https://export.arxiv.org/rss/cond-mat.mtrl-sci",
-    "https://export.arxiv.org/rss/physics.app-ph",
-    "https://export.arxiv.org/rss/physics.ins-det"
-]
+# 入力
+- title: {TITLE}
+- abstract: {ABSTRACT}
+- url: {URL}
 
-# === Hugging Face Inference API: 英語要約 & 日本語翻訳 ===
-HF_MODEL_SUMMARY = "facebook/bart-large-cnn"       # 英語要約
-HF_MODEL_TRANSLATE = "Helsinki-NLP/opus-mt-en-ja"  # 英語→日本語翻訳
+# 判定基準（重要：厳格に）
+次の3段階で判断せよ：
 
-HF_URL_SUMMARY = f"https://api-inference.huggingface.co/models/{HF_MODEL_SUMMARY}"
-HF_URL_TRANSLATE = f"https://api-inference.huggingface.co/models/{HF_MODEL_TRANSLATE}"
+(1) 必須条件チェック
+- TEM/STEM/SEM/EELS/4D-STEM/DPC/ptychography/electron diffraction/CBED/NBD など「電子顕微鏡・電子回折」系の明確な用語が、
+  titleまたはabstractに1つ以上含まれる → 次へ
+- ただし “electron” 単体や “microscopy” 単体（光学顕微鏡など曖昧）は不足。必ず TEM/STEM/EELS/diffraction など具体性が必要。
 
-HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+(2) 技術寄り判定（スコアリング）
+以下の要素があれば加点、無ければ減点：
+- 加点：新しい計測法・再構成・位相回復・検出器・分解能/感度改善・収差補正・モノクロ・4Dデータ解析・低線量・in-situ・偏向/位相計測
+- 減点：DFT/MDなど計算のみ、一般材料特性のみ、光学顕微鏡のみ、XRDのみ、理論物理のみ、電子顕微鏡が「使っただけ」で手法革新が無い
 
+(3) 除外ルール（強制）
+- 光学顕微鏡/蛍光/AFM/STMのみで電子顕微鏡要素がない → 非関連
+- “cryo-EM”でも、タンパク質構造決定など生物学中心で技術新規性が薄い → 低関連または非関連
+- “electron”が出ても電子顕微鏡ではなく電子デバイス/電子輸送の話 → 非関連
 
-def hf_call(api_url: str, text: str):
-    """共通の HF API 呼び出し関数。"""
-    if not HF_API_TOKEN:
-        return None, "[HF] APIトークンが設定されていません。"
+# 数値抽出（最重要）
+abstract中から、電子顕微鏡に関係する具体的数値をできるだけ抽出し、単位ごとに整理する。
+特に探す単位例：
+- 空間分解能：Å, angstrom, nm, pm
+- エネルギー分解能：eV, meV
+- 加速電圧：kV
+- 角度/収束/検出：mrad, degrees
+- 線量：e-/Å^2, e/nm^2, dose
+- 温度/圧力（in-situ）：K, °C, Pa, bar
+数値が無い場合は「not_found」と明記する（捏造しない）。
 
-    payload = {"inputs": text}
-    try:
-        resp = requests.post(api_url, headers=HF_HEADERS, json=payload, timeout=60)
-        if resp.status_code == 503:
-            # モデルが起動中など → 少し待ってリトライも検討可（ここではメッセージだけ）
-            return None, f"[HF] モデル起動中（503）。少し時間をおいて再実行してください。"
-        resp.raise_for_status()
-        return resp.json(), None
-    except requests.exceptions.RequestException as e:
-        return None, f"[HF] 通信エラー: {e}"
-    except Exception as e:
-        return None, f"[HF] 予期せぬエラー: {e}"
+# 出力形式（厳守）
+必ず JSON だけを出力。文章や前置きは禁止。
+スキーマは次の通り：
 
+{{
+  "relevance": "high|medium|low|reject",
+  "relevance_score": 0-100,
+  "decision_rationale_ja": "なぜそう判断したか（日本語で1-2文）",
+  "tech_tags": ["4D-STEM","vibrational EELS", "..."],
+  "novelty_points_ja": [
+    "何が新しいか（日本語で箇条書き、最大3点）"
+  ],
+  "key_numbers": {{
+    "spatial_resolution": ["..."],
+    "energy_resolution": ["..."],
+    "voltage": ["..."],
+    "angles": ["..."],
+    "dose": ["..."],
+    "in_situ_conditions": ["..."],
+    "other": ["..."]
+  }},
+  "one_paragraph_summary_ja": "日本語で3-5文の要約（技術と結果中心、一般論は禁止）",
+  "recommended_reading": "yes|maybe|no",
+  "url": "{URL}"
+}}
 
-def summarize_english(text: str) -> str:
-    """
-    英語 abstract を BART で英語要約。
-    """
-    prompt = (
-        "Summarize the following scientific abstract in concise English (3-4 sentences):\n\n" + text
-    )
-    data, err = hf_call(HF_URL_SUMMARY, prompt)
-    if err:
-        return f"[英語要約不可] {err}\n{text[:300]}"
+# タグ付けルール
+- tech_tags は必ず以下の正規化タグから選ぶ（表記ゆれは統一する）：
+  ["TEM","STEM","SEM","EELS","vibrational EELS","monochromated EELS","4D-STEM","DPC","ptychography","NBD","CBED","PED","electron diffraction","phase contrast TEM","holography","tomography","in-situ","low-dose","detector","aberration correction","dose-efficient reconstruction","phase retrieval"]
+- 該当が無いなら空配列 [] でも良いが、relevanceが high/medium なら通常は何か入るはず。
 
-    # 通常は [{"summary_text": "..."}] の形式
-    try:
-        if isinstance(data, list) and len(data) > 0:
-            if "summary_text" in data[0]:
-                return data[0]["summary_text"].strip()
-            elif "generated_text" in data[0]:
-                return data[0]["generated_text"].strip()
-        return f"[英語要約解析エラー] {str(data)[:400]}"
-    except Exception as e:
-        return f"[英語要約解析例外] {e}\n{str(data)[:400]}"
+# 厳格さ
+- 関連が薄い場合は reject を選んでよい（むしろ推奨）。
+- 具体的根拠のない推測は禁止。abstractに書かれていない数値は絶対に書かない。
+- 出力は必ず上のJSONスキーマに従う。
 
-
-def translate_to_japanese(english_text: str) -> str:
-    """
-    英語要約を日本語に翻訳。
-    """
-    data, err = hf_call(HF_URL_TRANSLATE, english_text)
-    if err:
-        return f"[日本語翻訳不可] {err}\n{english_text[:300]}"
-
-    # 通常は [{"translation_text": "..."}] の形式
-    try:
-        if isinstance(data, list) and len(data) > 0 and "translation_text" in data[0]:
-            return data[0]["translation_text"].strip()
-        return f"[翻訳結果解析エラー] {str(data)[:400]}"
-    except Exception as e:
-        return f"[翻訳結果解析例外] {e}\n{str(data)[:400]}"
-
-
-def summarize_en_to_ja(text: str) -> str:
-    """
-    英語 abstract → 英語要約 → 日本語翻訳 の2段方式。
-    """
-    eng_sum = summarize_english(text)
-    # もし英語要約がすでにエラーメッセージなら、そのまま返す
-    if eng_sum.startswith("[英語要約不可]") or eng_sum.startswith("[英語要約解析"):
-        return eng_sum
-    ja = translate_to_japanese(eng_sum)
-    return ja
-
-
-# === A. キーワード一致論文（電子顕微鏡関連） ===
-def fetch_keyword_matches():
-    results = []
-    for url in ARXIV_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries:
-            if any(k.lower() in entry.title.lower() for k in KEYWORDS):
-                ja_summary = summarize_en_to_ja(entry.summary)
-                results.append(f"■ **{entry.title}**\n{ja_summary}\nURL: {entry.link}")
-    return results
-
-
-# === B. 最新3件（リンクのみ） ===
-def fetch_latest_three():
-    all_entries = []
-    for url in ARXIV_FEEDS:
-        feed = feedparser.parse(url)
-        all_entries.extend(feed.entries)
-
-    def sort_key(e):
-        return e.get("published_parsed") or time.gmtime(0)
-
-    all_entries.sort(key=sort_key, reverse=True)
-    latest_three = all_entries[:3]
-
-    results = []
-    for entry in latest_three:
-        results.append(f"● **{entry.title}**\nURL: {entry.link}")
-    return results
-
-
-# === GitHub Issue 作成 ===
-def create_issue(title, body):
-    api_url = f"https://api.github.com/repos/{REPO}/issues"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    data = {"title": title, "body": body}
-
-    resp = requests.post(api_url, headers=headers, json=data)
-    if resp.status_code >= 300:
-        print("ERROR:", resp.status_code, resp.text)
-        resp.raise_for_status()
-
-
-# === Main ===
-if __name__ == "__main__":
-    kw_results     = fetch_keyword_matches()
-    latest_results = fetch_latest_three()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    title = f"電子顕微鏡 arXiv 日本語ウォッチ (HF 2段要約) {today}"
-
-    body_parts = []
-
-    body_parts.append("## 🔍 キーワード一致論文（電子顕微鏡関連: HF二段要約）")
-    body_parts.append("\n".join(kw_results) if kw_results else "該当なし")
-
-    body_parts.append("\n\n---\n\n## 🆕 新着arXiv論文（リンクのみ・最新3件）")
-    body_parts.append("\n".join(latest_results))
-
-    body = "\n".join(body_parts)
-    create_issue(title, body)
+さあ、次の入力を処理せよ：
+title: {TITLE}
+abstract: {ABSTRACT}
+url: {URL}
+"""
